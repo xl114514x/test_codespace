@@ -5,6 +5,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableBranch, RunnablePassthrough
 import sys
+import openai  # 添加此导入以修复 NameError: openai 未定义
 
 # SQLite3 版本修复
 try:
