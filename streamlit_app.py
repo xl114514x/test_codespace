@@ -35,10 +35,15 @@ def get_retriever():
         return None
     
     try:
+        # 获取 API 密钥
+        api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            st.error("未找到 OpenAI API 密钥，请在 Streamlit secrets 或环境变量中设置 OPENAI_API_KEY")
+            return None
+        
         # 定义 Embeddings
-        api_key = st.secrets.get("OPENAI_API_KEY")
         embedding = OpenAIEmbeddings(
-            openai_api_key="sk-bRG1dii8p3tpurPNhDXmyq1SIwd1DP4L2JwCkYyk5ltNqkVt",
+            openai_api_key=api_key,
             base_url="https://xiaoai.plus/v1"
         )
         # 向量数据库持久化路径
@@ -152,7 +157,7 @@ def get_qa_history_chain():
         ])
         
         retrieve_docs = RunnableBranch(
-            (lambda x: not x.get("chat_history", False), (lambda x: x["input"]) | retriever, ),
+            (lambda x: not x.get("chat_history", False), (lambda x: x["input"]) | retriever,),
             condense_question_prompt | llm | StrOutputParser() | retriever,
         )
         
@@ -179,7 +184,7 @@ def get_qa_history_chain():
         )
         
         qa_history_chain = RunnablePassthrough().assign(
-            context=retrieve_docs, 
+            context=retrieve_docs,
         ).assign(answer=qa_chain)
         
         return qa_history_chain
@@ -194,30 +199,17 @@ def gen_response(chain, input_text, chat_history):
         return
     
     try:
-        # 检查chain类型，如果是简单链则不需要context参数
-        if hasattr(chain, 'stream'):
-            if 'context' in str(chain):
-                # 完整的RAG链
-                response = chain.stream({
-                    "input": input_text,
-                    "chat_history": chat_history
-                })
-            else:
-                # 简单的问答链
-                response = chain.stream({
-                    "input": input_text,
-                    "chat_history": chat_history
-                })
-        else:
-            # 备用方案
-            response = [{"answer": "抱歉，当前无法处理您的请求。"}]
-        
+        response = chain.stream({
+            "input": input_text,
+            "chat_history": chat_history
+        })
         for res in response:
             if isinstance(res, dict) and "answer" in res:
                 yield res["answer"]
             elif isinstance(res, str):
                 yield res
-    
+    except openai.AuthenticationError as e:
+        yield f"认证错误: 提供的 OpenAI API 密钥无效。请访问 https://platform.openai.com/account/api-keys 获取新密钥，并更新 Streamlit secrets 或环境变量。"
     except Exception as e:
         yield f"生成回答时出错: {e}"
 
