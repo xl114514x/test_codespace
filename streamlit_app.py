@@ -44,8 +44,7 @@ def get_retriever():
         
         # 定义 Embeddings
         embedding = OpenAIEmbeddings(
-            openai_api_key=api_key,
-            base_url="https://xiaoai.plus/v1"
+            openai_api_key=api_key
         )
         # 向量数据库持久化路径
         persist_directory = './data_base/vector_db/chroma'
