@@ -6,3 +6,4 @@ openai
 pysqlite3-binary
 chromadb
 unstructured>=0.4.16
+openai
