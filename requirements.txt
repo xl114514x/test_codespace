@@ -1,0 +1,8 @@
+streamlit
+langchain-openai
+langchain-community
+langchain-core
+openai
+pysqlite3-binary
+chromadb
+unstructured>=0.4.16
