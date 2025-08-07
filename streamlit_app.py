@@ -1,271 +1,177 @@
-import streamlit as st
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-import os
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableBranch, RunnablePassthrough
-import sys
-import openai  # 添加此导入以修复 NameError: openai 未定义
+import io, os, sys  # 导入标准库，用于字节流处理、操作系统接口和系统退出
+from dotenv import load_dotenv  # 从 python-dotenv 加载 .env 环境变量
 
-# SQLite3 版本修复
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    pass  # 如果 pysqlite3 不可用，继续使用系统 sqlite3
+import streamlit as st  # 导入 Streamlit，用于搭建网页应用
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings  # 导入 LangChain 的 OpenAI LLM 接口和嵌入模型
+from langchain_chroma import Chroma  # 改用新版 langchain-chroma
+from langchain_core.output_parsers import StrOutputParser  # 导入输出解析器
+from langchain_core.prompts import ChatPromptTemplate  # 导入对话提示模板
+from langchain_core.runnables import RunnableBranch, RunnablePassthrough  # 导入可运行组件
 
-# ChromaDB 导入和错误处理
-try:
-    from langchain_community.vectorstores import Chroma
-    CHROMA_AVAILABLE = True
-except ImportError as e:
-    st.error(f"ChromaDB导入失败: {e}")
-    CHROMA_AVAILABLE = False
-except RuntimeError as e:
-    if "sqlite3" in str(e).lower():
-        st.error("SQLite3 版本不兼容，正在使用备用方案...")
-        CHROMA_AVAILABLE = False
-    else:
-        st.error(f"ChromaDB运行时错误: {e}")
-        CHROMA_AVAILABLE = False
+import PyPDF2  # 导入 PyPDF2 用于解析 PDF 文本
+import docx  # 导入 python-docx 用于解析 .docx 文档
+
+# —— 环境 & API Key —— #
+load_dotenv()  # 读取项目根目录下的 .env 文件
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # 从环境变量中获取 OpenAI API Key
+if not OPENAI_API_KEY:
+    st.error("请在 .env 文件中设置 OPENAI_API_KEY")  # 如果未设置，显示错误提示
+    sys.exit(1)  # 退出程序
+
+# —— 页面 & 样式 —— #
+st.set_page_config(page_title="重庆科技大学问答系统", layout="wide")  # 配置 Streamlit 页面标题和布局
+st.markdown(
+    "<h1 style='text-align:center;color:#333;margin-bottom:16px;'>🎓 重庆科技大学问答系统</h1>",
+    unsafe_allow_html=True,  # 允许 HTML 渲染，用于自定义标题
+)
+st.markdown("""
+<style>
+.upload-box {
+  border:1px dashed #bbb;
+  border-radius:6px;
+  height:200px;
+  text-align:center;
+  padding-top:60px;
+  color:#666;
+  margin-bottom:16px;
+}
+header, footer { visibility: hidden; }  /* 隐藏默认的 header 和 footer */
+</style>
+""", unsafe_allow_html=True)  # 注入自定义 CSS 样式
+
+# —— 向量库 & RAG —— #
+PERSIST_DIR = "workspaces/test_codespace/chroma_db"  # 向量库持久化目录
+EMBEDDER = OpenAIEmbeddings(api_key=OPENAI_API_KEY, base_url="https://xiaoai.plus/v1")
+# 初始化 OpenAI 嵌入模型，指定 API Key 和接口地址
+
+def split_text(text, chunk_size=500):
+    """按固定大小拆分文本为多个片段"""
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def extract_text(f):
+    """根据文件类型提取纯文本"""
+    name = f.name.lower()
+    data = f.read()
+    if name.endswith(".txt"):
+        return data.decode("utf-8", errors="ignore")
+    if name.endswith(".pdf"):
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    if name.endswith(".docx"):
+        d = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in d.paragraphs)
+    return ""
+
+def index_file(f):
+    """将单个文件的文本拆分、嵌入并存入 Chroma 向量库"""
+    txt = extract_text(f)
+    if not txt:
+        return 0
+    chunks = split_text(txt)
+    db = Chroma(persist_directory=PERSIST_DIR, embedding_function=EMBEDDER)
+    db.add_texts(chunks)
+    # 新版 Chroma 自动持久化，无需手动调用 db.persist()
+    return len(chunks)
 
 def get_retriever():
-    if not CHROMA_AVAILABLE:
-        st.warning("ChromaDB不可用，将使用简单的文本搜索作为备用方案")
-        return None
-    
-    try:
-        # 获取 API 密钥
-        api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("未找到 OpenAI API 密钥，请在 Streamlit secrets 或环境变量中设置 OPENAI_API_KEY")
-            return None
-        
-        # 定义 Embeddings
-        embedding = OpenAIEmbeddings(
-            openai_api_key="sk-bRG1dii8p3tpurPNhDXmyq1SIwd1DP4L2JwCkYyk5ltNqkVt"
-        )
-        # 向量数据库持久化路径
-        persist_directory = './data_base/vector_db/chroma'
-        
-        # 检查目录是否存在
-        if not os.path.exists(persist_directory):
-            st.warning(f"向量数据库目录不存在: {persist_directory}")
-            return None
-        
-        # 加载数据库
-        vectordb = Chroma(
-            persist_directory=persist_directory,
-            embedding_function=embedding
-        )
-        return vectordb.as_retriever()
-    
-    except Exception as e:
-        st.error(f"创建检索器时出错: {e}")
-        return None
-
-def simple_fallback_retriever(query, knowledge_base=None):
-    """
-    简单的备用检索器，当ChromaDB不可用时使用
-    """
-    if knowledge_base is None:
-        # 这里可以添加一些预设的知识库内容
-        knowledge_base = [
-            "这是一个示例知识库内容。",
-            "当ChromaDB不可用时，我们使用这个简单的文本匹配。",
-            "您可以在这里添加您的知识库内容。"
-        ]
-    
-    # 简单的关键词匹配
-    relevant_docs = []
-    for doc in knowledge_base:
-        if any(keyword.lower() in doc.lower() for keyword in query.split()):
-            relevant_docs.append(doc)
-    
-    return relevant_docs[:3]  # 返回最多3个相关文档
+    """创建一个检索器，用于基于查询向量检索文档"""
+    return Chroma(persist_directory=PERSIST_DIR, embedding_function=EMBEDDER).as_retriever()
 
 def combine_docs(docs):
-    if isinstance(docs, dict) and "context" in docs:
-        return "\n\n".join(doc.page_content for doc in docs["context"])
-    elif isinstance(docs, list):
-        return "\n\n".join(docs)
-    return str(docs) if docs else ""
+    """将检索到的文档内容拼接为单个上下文字符串"""
+    return "\n\n".join(d.page_content for d in docs["context"])
 
-def get_qa_chain_without_retriever():
-    """
-    不使用检索器的简单问答链
-    """
-    try:
-        api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("未找到 OpenAI API 密钥")
-            return None
-        
-        llm = ChatOpenAI(
-            model_name="gpt-4o", 
-            temperature=0,
-            openai_api_key=api_key
-        )
-        
-        system_prompt = (
-            "你是一个友好的助手。请根据用户的问题提供有帮助的回答。"
-            "如果你不知道答案，请诚实地说不知道。"
-        )
-        
-        qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-        ])
-        
-        return qa_prompt | llm | StrOutputParser()
-    
-    except Exception as e:
-        st.error(f"创建问答链时出错: {e}")
-        return None
+def build_chain():
+    """构建一个 RAG 问答链，包括历史浓缩和最终问答"""
+    retriever = get_retriever()
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0,
+                     api_key=OPENAI_API_KEY, base_url="https://xiaoai.plus/v1")
+    # 步骤一：如果有历史则浓缩，否则直接使用输入
+    condense = ChatPromptTemplate([
+        ("system","总结用户最近的问题；如无历史则返回原问题。"),
+        ("placeholder","{chat_history}"),
+        ("human","{input}"),
+    ])
+    branch = RunnableBranch(
+        (lambda x: not x.get("chat_history"), (lambda x: x["input"]) | retriever),
+        condense | llm | StrOutputParser() | retriever,
+    )
+    # 步骤二：基于检索上下文做最终问答
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "你是重庆科技大学问答系统，使用检索到的上下文回答；"
+         "如无答案，请说“我不知道”。\n\n{context}"
+        ),
+        ("placeholder","{chat_history}"),
+        ("human","{input}"),
+    ])
+    qa = (RunnablePassthrough().assign(context=combine_docs)
+          | prompt | llm | StrOutputParser())
+    return RunnablePassthrough().assign(context=branch).assign(answer=qa)
 
-def get_qa_history_chain():
-    retriever = get_retriever()
-    
-    try:
-        api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("未找到 OpenAI API 密钥，请在 Streamlit secrets 中设置 OPENAI_API_KEY")
-            return None
-        
-        llm = ChatOpenAI(
-            model_name="gpt-4o", 
-            temperature=0,
-            openai_api_key=api_key
-        )
-        
-        if retriever is None:
-            # 使用简单的问答链作为备用方案
-            st.info("使用简化模式，无检索功能")
-            return get_qa_chain_without_retriever()
-        
-        condense_question_system_template = (
-            "请根据聊天记录总结用户最近的问题，"
-            "如果没有多余的聊天记录则返回用户的问题。"
-        )
-        
-        condense_question_prompt = ChatPromptTemplate([
-            ("system", condense_question_system_template),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-        ])
-        
-        retrieve_docs = RunnableBranch(
-            (lambda x: not x.get("chat_history", False), (lambda x: x["input"]) | retriever,),
-            condense_question_prompt | llm | StrOutputParser() | retriever,
-        )
-        
-        system_prompt = (
-            "你是一个问答任务的助手。 "
-            "请使用检索到的上下文片段回答这个问题。 "
-            "如果你不知道答案就说不知道。 "
-            "请使用简洁的话语回答用户。"
-            "\n\n"
-            "{context}"
-        )
-        
-        qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-        ])
-        
-        qa_chain = (
-            RunnablePassthrough().assign(context=combine_docs)
-            | qa_prompt
-            | llm
-            | StrOutputParser()
-        )
-        
-        qa_history_chain = RunnablePassthrough().assign(
-            context=retrieve_docs,
-        ).assign(answer=qa_chain)
-        
-        return qa_history_chain
-    
-    except Exception as e:
-        st.error(f"创建问答链时出错: {e}")
-        return get_qa_chain_without_retriever()
+def get_answer(chain, q, hist):
+    """调用 RAG 链并返回 AI 回答"""
+    res = chain.invoke({"input": q, "chat_history": hist})
+    return res["answer"]
 
-def gen_response(chain, input_text, chat_history):
-    if not chain:
-        yield "抱歉，系统初始化失败，无法回答问题。"
-        return
-    
-    try:
-        response = chain.stream({
-            "input": input_text,
-            "chat_history": chat_history
-        })
-        for res in response:
-            if isinstance(res, dict) and "answer" in res:
-                yield res["answer"]
-            elif isinstance(res, str):
-                yield res
-    except openai.AuthenticationError as e:
-        yield f"认证错误: 提供的 OpenAI API 密钥无效。请访问 https://platform.openai.com/account/api-keys 获取新密钥，并更新 Streamlit secrets 或环境变量。"
-    except Exception as e:
-        yield f"生成回答时出错: {e}"
-
+# —— 主逻辑 —— #
 def main():
-    st.set_page_config(
-        page_title="问答助手",
-        page_icon="🦜",
-        layout="wide"
-    )
-    
-    st.markdown('### 🦜🔗 动手学大模型应用开发')
-    
-    # 显示系统状态
-    if not CHROMA_AVAILABLE:
-        st.warning("⚠️ ChromaDB不可用，正在使用简化模式")
-    else:
-        st.success("✅ 系统正常运行")
-    
-    # 存储对话历史
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # 存储检索问答链
-    if "qa_history_chain" not in st.session_state:
-        with st.spinner("正在初始化系统..."):
-            st.session_state.qa_history_chain = get_qa_history_chain()
-    
-    # 建立容器
-    messages = st.container(height=550)
-    
-    # 显示整个对话历史
-    for message in st.session_state.messages:
-        with messages.chat_message(message[0]):
-            st.write(message[1])
-    
-    if prompt := st.chat_input("请输入您的问题"):
-        # 将用户输入添加到对话历史中
-        st.session_state.messages.append(("human", prompt))
-        
-        # 显示当前用户输入
-        with messages.chat_message("human"):
-            st.write(prompt)
-        
-        # 生成回复
-        answer_generator = gen_response(
-            chain=st.session_state.qa_history_chain,
-            input_text=prompt,
-            chat_history=st.session_state.messages
-        )
-        
-        # 流式输出
-        with messages.chat_message("ai"):
-            output = st.write_stream(answer_generator)
-        
-        # 将输出存入对话历史
-        st.session_state.messages.append(("ai", output))
+    # 初始化会话状态
+    if "msgs" not in st.session_state:
+        st.session_state.msgs = []  # 存储人机对话的列表 [(role, msg), ...]
+    if "chain" not in st.session_state:
+        st.session_state.chain = build_chain()
+
+    col1, col2 = st.columns([3, 1])  # 左右两列布局：3:1
+
+    # 右侧：知识库上传（支持多文件）
+    with col2:
+        st.markdown("### 📂 上传文件到知识库", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='upload-box'>将文件拖放或点击上传<br/>(txt/pdf/docx，支持多选)</div>",
+            unsafe_allow_html=True,
+        )
+        uploaded_files = st.file_uploader(
+            label="上传文件",  # 非空 label
+            type=["txt","pdf","docx"],
+            accept_multiple_files=True,
+            key="uploader",
+            label_visibility="hidden"  # 隐藏 label
+        )
+        if uploaded_files:
+            for f in uploaded_files:
+                cnt = index_file(f)
+                if cnt:
+                    st.success(f"{f.name} 已索引 {cnt} 段文本")
+                else:
+                    st.error(f"{f.name} 解析/索引失败")
+
+    # 左侧：消息列表和用户输入
+    with col1:
+        if prompt := st.chat_input("说点什么…", key="chat_input"):
+            st.session_state.msgs.append(("human", prompt))
+            with st.spinner("AI 正在思考…"):
+                ans = get_answer(st.session_state.chain, prompt, st.session_state.msgs)
+            st.session_state.msgs.append(("ai", ans))
+            if len(st.session_state.msgs) > 20:
+                st.session_state.msgs = st.session_state.msgs[-20:]
+
+        for role, msg in st.session_state.msgs:
+            with st.chat_message(role):
+                if role == "ai":
+                    st.code(msg)
+                else:
+                    st.write(msg)
+
+        if st.session_state.msgs and st.session_state.msgs[-1][0] == "ai":
+            if st.button("🔄 重新生成上次回答"):
+                st.session_state.msgs.pop()
+                last_user = next((m for r, m in reversed(st.session_state.msgs) if r == "human"), None)
+                if last_user:
+                    with st.spinner("AI 正在重新思考…"):
+                        new_ans = get_answer(st.session_state.chain, last_user, st.session_state.msgs)
+                    st.session_state.msgs.append(("ai", new_ans))
 
 if __name__ == "__main__":
-    main()
+    main()  # 执行主逻辑
+
